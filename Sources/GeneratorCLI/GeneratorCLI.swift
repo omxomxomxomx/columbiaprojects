@@ -12,6 +12,7 @@
 
 import ArgumentParser
 import SwiftSDKGenerator
+import FoundationInternationalization
 
 @main
 struct GeneratorCLI: AsyncParsableCommand {
@@ -100,29 +101,8 @@ struct GeneratorCLI: AsyncParsableCommand {
       .generateBundle(shouldGenerateFromScratch: !self.incremental)
     }
 
-    print("\nTime taken for this generator run: \(elapsed.intervalString).")
+    print("\nTime taken for this generator run: \(elapsed.formatted()).")
   }
 }
 
 extension Triple.CPU: ExpressibleByArgument {}
-
-// FIXME: replace this with a call on `.formatted()` on `Duration` when it's available in swift-foundation.
-import Foundation
-
-extension Duration {
-  var intervalString: String {
-    let reference = Date()
-    let date = Date(timeInterval: TimeInterval(self.components.seconds), since: reference)
-
-    let components = Calendar.current.dateComponents([.hour, .minute, .second], from: reference, to: date)
-
-    if let hours = components.hour, hours > 0 {
-      return String(format: "%02d:%02d:%02d", hours, components.minute ?? 0, components.second ?? 0)
-    } else if let minutes = components.minute, minutes > 0 {
-      let seconds = components.second ?? 0
-      return "\(minutes) minute\(minutes != 1 ? "s" : "") \(seconds) second\(seconds != 1 ? "s" : "")"
-    } else {
-      return "\(components.second ?? 0) seconds"
-    }
-  }
-}
