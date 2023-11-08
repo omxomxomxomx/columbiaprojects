@@ -5,10 +5,12 @@
 // Copyright (c) 2022-2023 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
+
+import struct SystemPackage.FilePath
 
 private let unusedDarwinPlatforms = [
   "watchsimulator",
@@ -38,12 +40,13 @@ extension SwiftSDKGenerator {
       try await fileSystem.unpack(file: downloadableArtifacts.hostSwift.localPath, into: tmpDir)
       // Remove libraries for platforms we don't intend cross-compiling to
       for platform in unusedDarwinPlatforms {
-        try fileSystem.removeRecursively(at: tmpDir.appending("usr/lib/swift/\(platform)"))
+        try await fileSystem.removeRecursively(at: tmpDir.appending("usr/lib/swift/\(platform)"))
+        try await fileSystem.removeRecursively(at: tmpDir.appending("usr/lib/swift_static/\(platform)"))
       }
-      try fileSystem.removeRecursively(at: tmpDir.appending("usr/lib/sourcekitd.framework"))
+      try await fileSystem.removeRecursively(at: tmpDir.appending("usr/lib/sourcekitd.framework"))
 
       for binary in unusedHostBinaries {
-        try fileSystem.removeRecursively(at: tmpDir.appending("usr/bin/\(binary)"))
+        try await fileSystem.removeRecursively(at: tmpDir.appending("usr/bin/\(binary)"))
       }
 
       try await fileSystem.rsync(from: tmpDir.appending("usr"), to: pathsConfiguration.toolchainDirPath)
@@ -66,39 +69,43 @@ extension SwiftSDKGenerator {
     }
   }
 
-  func unpackLLDLinker() async throws {
+  func prepareLLDLinker() async throws {
     logGenerationStep("Unpacking and copying `lld` linker...")
     let downloadableArtifacts = self.downloadableArtifacts
     let pathsConfiguration = self.pathsConfiguration
     let targetOS = self.targetTriple.os
 
-    try await inTemporaryDirectory { fileSystem, tmpDir in
-      let llvmArtifact = downloadableArtifacts.hostLLVM
-      try await fileSystem.untar(
-        file: llvmArtifact.localPath,
-        into: tmpDir,
-        stripComponents: 1
-      )
+    let llvmArtifact = downloadableArtifacts.hostLLVM
 
-      let unpackedLLDPath = if llvmArtifact.isPrebuilt {
-        tmpDir.appending("bin/lld")
-      } else {
-        try await self.buildLLD(llvmSourcesDirectory: tmpDir)
-      }
+    let untarDestination = pathsConfiguration.artifactsCachePath.appending(
+      FilePath.Component(llvmArtifact.localPath.stem!)!.stem
+    )
+    try self.createDirectoryIfNeeded(at: untarDestination)
+    try await self.untar(
+      file: llvmArtifact.localPath,
+      into: untarDestination,
+      stripComponents: 1
+    )
 
-      let toolchainLLDPath = switch targetOS {
-      case .linux:
-        pathsConfiguration.toolchainBinDirPath.appending("ld.lld")
-      case .wasi:
-        pathsConfiguration.toolchainBinDirPath.appending("wasm-ld")
-      default:
-        fatalError()
-      }
-
-      try fileSystem.copy(
-        from: unpackedLLDPath,
-        to: toolchainLLDPath
-      )
+    let unpackedLLDPath = if llvmArtifact.isPrebuilt {
+      untarDestination.appending("bin/lld")
+    } else {
+      try await self.engine[CMakeBuildQuery(
+        sourcesDirectory: untarDestination,
+        outputBinarySubpath: ["bin", "lld"],
+        options: "-DLLVM_ENABLE_PROJECTS=lld -DLLVM_TARGETS_TO_BUILD=\(self.targetTriple.cpu.llvmTargetConventionName)"
+      )].path
     }
+
+    let toolchainLLDPath = switch targetOS {
+    case .linux:
+      pathsConfiguration.toolchainBinDirPath.appending("ld.lld")
+    case .wasi:
+      pathsConfiguration.toolchainBinDirPath.appending("wasm-ld")
+    default:
+      fatalError()
+    }
+
+    try self.copy(from: unpackedLLDPath, to: toolchainLLDPath)
   }
 }

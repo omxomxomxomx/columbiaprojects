@@ -5,8 +5,8 @@
 // Copyright (c) 2022-2023 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -79,16 +79,17 @@ struct GeneratorCLI: AsyncParsableCommand {
   var targetArch: Triple.CPU? = nil
 
   mutating func run() async throws {
-    let linuxDistributionVersion = switch self.linuxDistributionName {
+    let linuxDistributionDefaultVersion = switch self.linuxDistributionName {
     case .rhel:
       "ubi9"
     case .ubuntu:
       "22.04"
     }
+    let linuxDistributionVersion = self.linuxDistributionVersion ?? linuxDistributionDefaultVersion
     let linuxDistribution = try LinuxDistribution(name: linuxDistributionName, version: linuxDistributionVersion)
 
     let elapsed = try await ContinuousClock().measure {
-      try await LocalSwiftSDKGenerator(
+      let generator = try await SwiftSDKGenerator(
         hostCPUArchitecture: self.hostArch,
         targetCPUArchitecture: self.targetArch,
         swiftVersion: self.swiftVersion,
@@ -98,7 +99,13 @@ struct GeneratorCLI: AsyncParsableCommand {
         shouldUseDocker: self.withDocker,
         isVerbose: self.verbose
       )
-      .generateBundle(shouldGenerateFromScratch: !self.incremental)
+      do {
+        try await generator.generateBundle(shouldGenerateFromScratch: !self.incremental)
+        try await generator.shutDown()
+      } catch {
+        try await generator.shutDown()
+        throw error
+      }
     }
 
     print("\nTime taken for this generator run: \(elapsed.formatted()).")

@@ -5,22 +5,26 @@
 // Copyright (c) 2022-2023 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 import AsyncAlgorithms
 import AsyncHTTPClient
+import GeneratorEngine
 import RegexBuilder
 
 import class Foundation.ByteCountFormatter
+import class Foundation.FileManager
 import struct Foundation.URL
+
+import struct SystemPackage.FilePath
 
 private let ubuntuAMD64Mirror = "http://gb.archive.ubuntu.com/ubuntu"
 private let ubuntuARM64Mirror = "http://ports.ubuntu.com/ubuntu-ports"
 
-private let byteCountFormatter = ByteCountFormatter()
+let byteCountFormatter = ByteCountFormatter()
 
 extension SwiftSDKGenerator {
   func downloadArtifacts(_ client: HTTPClient) async throws {
@@ -35,42 +39,23 @@ extension SwiftSDKGenerator {
       downloadableArtifacts.useLLVMSources()
     }
 
-    let hostSwiftProgressStream = client.streamDownloadProgress(for: downloadableArtifacts.hostSwift)
-      .removeDuplicates(by: didProgressChangeSignificantly)
-    let hostLLVMProgressStream = client.streamDownloadProgress(for: downloadableArtifacts.hostLLVM)
-      .removeDuplicates(by: didProgressChangeSignificantly)
+    let results = try await withThrowingTaskGroup(of: FileCacheRecord.self) { group in
+      for item in self.downloadableArtifacts.allItems {
+        group.addTask {
+          try await self.engine[DownloadArtifactQuery(artifact: item)]
+        }
+      }
 
-    print("Using these URLs for downloads:")
-
-    for artifact in downloadableArtifacts.allItems {
-      print(artifact.remoteURL)
+      var result = [FileCacheRecord]()
+      for try await file in group {
+        result.append(file)
+      }
+      return result
     }
 
-    // FIXME: some code duplication is necessary due to https://github.com/apple/swift-async-algorithms/issues/226
-    if shouldUseDocker {
-      let stream = combineLatest(hostSwiftProgressStream, hostLLVMProgressStream)
-        .throttle(for: .seconds(1))
-
-      for try await (swiftProgress, llvmProgress) in stream {
-        report(progress: swiftProgress, for: downloadableArtifacts.hostSwift)
-        report(progress: llvmProgress, for: downloadableArtifacts.hostLLVM)
-      }
-    } else {
-      let targetSwiftProgressStream = client.streamDownloadProgress(for: downloadableArtifacts.targetSwift)
-        .removeDuplicates(by: didProgressChangeSignificantly)
-
-      let stream = combineLatest(
-        hostSwiftProgressStream,
-        hostLLVMProgressStream,
-        targetSwiftProgressStream
-      )
-      .throttle(for: .seconds(1))
-
-      for try await (hostSwiftProgress, hostLLVMProgress, targetSwiftProgress) in stream {
-        report(progress: hostSwiftProgress, for: downloadableArtifacts.hostSwift)
-        report(progress: hostLLVMProgress, for: downloadableArtifacts.hostLLVM)
-        report(progress: targetSwiftProgress, for: downloadableArtifacts.targetSwift)
-      }
+    print("Using downloaded artifacts in these locations:")
+    for path in results.map(\.path) {
+      print(path)
     }
   }
 
@@ -78,14 +63,14 @@ extension SwiftSDKGenerator {
     logGenerationStep("Parsing Ubuntu packages list...")
 
     async let mainPackages = try await client.parseUbuntuPackagesList(
-      ubuntuRelease: versionsConfiguration.linuxDistribution.release,
+      ubuntuRelease: self.versionsConfiguration.linuxDistribution.release,
       repository: "main",
       targetTriple: self.targetTriple,
       isVerbose: self.isVerbose
     )
 
     async let updatesPackages = try await client.parseUbuntuPackagesList(
-      ubuntuRelease: versionsConfiguration.linuxDistribution.release,
+      ubuntuRelease: self.versionsConfiguration.linuxDistribution.release,
       releaseSuffix: "-updates",
       repository: "main",
       targetTriple: self.targetTriple,
@@ -117,8 +102,8 @@ extension SwiftSDKGenerator {
     let pathsConfiguration = self.pathsConfiguration
 
     try await inTemporaryDirectory { fs, tmpDir in
-      let progress = try await client.downloadFiles(from: urls, to: tmpDir)
-      report(downloadedFiles: Array(zip(urls, progress.map(\.receivedBytes))))
+      let downloadedFiles = try await self.downloadFiles(from: urls, to: tmpDir)
+      report(downloadedFiles: downloadedFiles)
 
       for fileName in urls.map(\.lastPathComponent) {
         try await fs.unpack(file: tmpDir.appending(fileName), into: pathsConfiguration.sdkDirPath)
@@ -127,9 +112,32 @@ extension SwiftSDKGenerator {
 
     try createDirectoryIfNeeded(at: pathsConfiguration.toolchainBinDirPath)
   }
+
+  func downloadFiles(from urls: [URL], to directory: FilePath) async throws -> [(URL, UInt64)] {
+    try await withThrowingTaskGroup(of: (URL, UInt64).self) {
+      for url in urls {
+        $0.addTask {
+          let downloadedFilePath = try await self.engine[DownloadFileQuery(remoteURL: url, localDirectory: directory)]
+          let filePath = downloadedFilePath.path
+          guard let fileSize = try FileManager.default.attributesOfItem(
+            atPath: filePath.string
+          )[.size] as? UInt64 else {
+            throw GeneratorError.fileDoesNotExist(filePath)
+          }
+          return (url, fileSize)
+        }
+      }
+
+      var result = [(URL, UInt64)]()
+      for try await progress in $0 {
+        result.append(progress)
+      }
+      return result
+    }
+  }
 }
 
-private func report(downloadedFiles: [(URL, Int)]) {
+private func report(downloadedFiles: [(URL, UInt64)]) {
   for (url, bytes) in downloadedFiles {
     print("\(url) – \(byteCountFormatter.string(fromByteCount: Int64(bytes)))")
   }
@@ -212,42 +220,5 @@ extension HTTPClient {
     }
 
     return result
-  }
-}
-
-/// Checks whether two given progress value are different enough from each other. Used for filtering out progress
-/// values in async streams with `removeDuplicates` operator.
-/// - Parameters:
-///   - previous: Preceding progress value in the stream.
-///   - current: Currently processed progress value in the stream.
-/// - Returns: `true` if `totalBytes` value is different by any amount or if `receivedBytes` is different by amount
-/// larger than 1MiB. Returns `false` otherwise.
-@Sendable
-private func didProgressChangeSignificantly(
-  previous: FileDownloadDelegate.Progress,
-  current: FileDownloadDelegate.Progress
-) -> Bool {
-  guard previous.totalBytes == current.totalBytes else {
-    return true
-  }
-
-  return current.receivedBytes - previous.receivedBytes > 1024 * 1024 * 1024
-}
-
-private func report(progress: FileDownloadDelegate.Progress, for artifact: DownloadableArtifacts.Item) {
-  if let total = progress.totalBytes {
-    print("""
-    \(artifact.remoteURL.lastPathComponent) \(
-      byteCountFormatter
-        .string(fromByteCount: Int64(progress.receivedBytes))
-    )/\(
-      byteCountFormatter
-        .string(fromByteCount: Int64(total))
-    )
-    """)
-  } else {
-    print(
-      "\(artifact.remoteURL.lastPathComponent) \(byteCountFormatter.string(fromByteCount: Int64(progress.receivedBytes)))"
-    )
   }
 }
