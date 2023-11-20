@@ -15,7 +15,7 @@ import SystemPackage
 extension SwiftSDKGenerator {
   func copyTargetSwiftFromDocker() async throws {
     logGenerationStep("Launching a Docker container to copy Swift SDK for the target triple from it...")
-    let containerID = try await launchDockerContainer(imageName: self.versionsConfiguration.swiftBaseDockerImage)
+    let containerID = try await launchDockerContainer(imageName: self.baseDockerImage)
     do {
       let pathsConfiguration = self.pathsConfiguration
 
@@ -64,7 +64,7 @@ extension SwiftSDKGenerator {
         }
 
         try await generator.createDirectoryIfNeeded(at: sdkUsrLibPath)
-        var subpaths =  ["clang", "gcc", "swift", "swift_static"]
+        var subpaths = ["clang", "gcc", "swift", "swift_static"]
 
         // Ubuntu's multiarch directory scheme puts some libraries in
         // architecture-specific directories:
